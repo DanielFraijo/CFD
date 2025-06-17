@@ -1,0 +1,699 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy import signal
+from scipy.fft import fft, fftfreq
+import re
+import os
+from typing import List, Dict, Tuple, Optional, Union
+import warnings
+warnings.filterwarnings('ignore')
+
+class DATFileParser:
+    """
+    A robust parser for various .dat file formats with intelligent data extraction
+    """
+    
+    def __init__(self, filename: str):
+        self.filename = filename
+        self.raw_data = None
+        self.headers = []
+        self.data_arrays = {}
+        self.numeric_data = None
+        self.data_start_line = 0
+        
+    def read_file(self) -> List[str]:
+        """Read file with multiple encoding attempts"""
+        encodings = ['utf-8', 'latin-1', 'cp1252', 'ascii']
+        
+        for encoding in encodings:
+            try:
+                with open(self.filename, 'r', encoding=encoding) as f:
+                    return f.readlines()
+            except UnicodeDecodeError:
+                continue
+        
+        with open(self.filename, 'rb') as f:
+            content = f.read().decode('utf-8', errors='ignore')
+            return content.splitlines()
+    
+    def detect_headers_and_data_start(self, lines: List[str]) -> Tuple[List[str], int]:
+        """
+        Intelligently detect headers and where data starts
+        """
+        headers = []
+        data_start = 0
+        
+        header_patterns = [
+            r'Variables\s*=\s*(.+)',
+            r'VARIABLES\s*=\s*(.+)',
+            r'#\s*(.+)',
+            r'%\s*(.+)',
+            r'//\s*(.+)',
+        ]
+        
+        for i, line in enumerate(lines):
+            line = line.strip()
+            
+            if not line:
+                continue
+                
+            header_found = False
+            for pattern in header_patterns:
+                match = re.match(pattern, line, re.IGNORECASE)
+                if match:
+                    header_line = match.group(1)
+                    headers = self.parse_header_line(header_line)
+                    header_found = True
+                    break
+            
+            if header_found:
+                data_start = i + 1
+                continue
+            
+            if self.is_numeric_line(line):
+                if not headers and not self.is_all_numeric_tokens(line):
+                    potential_headers = self.extract_potential_headers(line)
+                    if potential_headers:
+                        headers = potential_headers
+                        data_start = i + 1
+                        continue
+                
+                if not headers:
+                    headers = self.search_headers_backwards(lines, i)
+                
+                if not data_start:
+                    data_start = i
+                break
+            
+            if not headers and self.could_be_header_line(line):
+                potential_headers = self.extract_potential_headers(line)
+                if potential_headers:
+                    headers = potential_headers
+                    if i + 1 < len(lines) and self.is_numeric_line(lines[i + 1].strip()):
+                        data_start = i + 1
+        
+        return headers, data_start
+    
+    def parse_header_line(self, header_line: str) -> List[str]:
+        """Parse a header line into individual column names"""
+        header_line = re.sub(r'["\']', '', header_line)
+        
+        delimiters = [',', '\t', ' ', ';']
+        
+        for delimiter in delimiters:
+            if delimiter in header_line:
+                headers = [h.strip() for h in header_line.split(delimiter) if h.strip()]
+                if len(headers) > 1:
+                    return headers
+        
+        headers = header_line.split()
+        return [h.strip() for h in headers if h.strip()]
+    
+    def is_numeric_line(self, line: str) -> bool:
+        """Check if a line contains numeric data"""
+        if not line.strip():
+            return False
+        
+        tokens = re.split(r'[,\s\t;]+', line.strip())
+        tokens = [t for t in tokens if t]
+        
+        if len(tokens) == 0:
+            return False
+        
+        numeric_count = 0
+        for token in tokens:
+            try:
+                float(token)
+                numeric_count += 1
+            except ValueError:
+                if re.match(r'^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$', token):
+                    numeric_count += 1
+        
+        return numeric_count / len(tokens) >= 0.8
+    
+    def is_all_numeric_tokens(self, line: str) -> bool:
+        """Check if ALL tokens in a line are numeric"""
+        tokens = re.split(r'[,\s\t;]+', line.strip())
+        tokens = [t for t in tokens if t]
+        
+        if len(tokens) == 0:
+            return False
+        
+        for token in tokens:
+            try:
+                float(token)
+            except ValueError:
+                if not re.match(r'^[+-]?(\d+\.?\d* prefeito.\d+)([eE][+-]?\d+)?$', token):
+                    return False
+        return True
+    
+    def could_be_header_line(self, line: str) -> bool:
+        """Check if a line could contain headers"""
+        if not line.strip():
+            return False
+        
+        if any(line.strip().startswith(prefix) for prefix in ['#', '//', '%', '!', '*']):
+            return False
+        
+        tokens = re.split(r'[,\s\t;]+', line.strip())
+        tokens = [t for t in tokens if t]
+        
+        if len(tokens) < 2:
+            return False
+        
+        alpha_count = 0
+        for token in tokens:
+            if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', token) or any(char.isalpha() for char in token):
+                alpha_count += 1
+        
+        return alpha_count >= len(tokens) * 0.5
+    
+    def extract_potential_headers(self, line: str) -> List[str]:
+        """Extract potential header names from a line"""
+        tokens = re.split(r'[,\s\t;]+', line.strip())
+        tokens = [t.strip() for t in tokens if t.strip()]
+        
+        cleaned_tokens = []
+        for token in tokens:
+            token = re.sub(r'^["\'\[\(]|["\'\]\)]$', '', token)
+            if token and not token.isdigit():
+                cleaned_tokens.append(token)
+        
+        return cleaned_tokens if len(cleaned_tokens) >= 2 else []
+    
+    def search_headers_backwards(self, lines: List[str], current_line: int) -> List[str]:
+        """Search backwards for potential headers"""
+        for i in range(current_line - 1, max(0, current_line - 10), -1):
+            line = lines[i].strip()
+            if line and self.could_be_header_line(line):
+                return self.extract_potential_headers(line)
+        return []
+    
+    def parse_data_lines(self, lines: List[str], start_line: int) -> np.ndarray:
+        """Parse numeric data from lines"""
+        data_rows = []
+        expected_columns = None
+        
+        for i in range(start_line, len(lines)):
+            line = lines[i].strip()
+            if not line:
+                continue
+            
+            if not self.is_numeric_line(line):
+                continue
+            
+            tokens = re.split(r'[,\s\t;]+', line)
+            row = []
+            
+            for token in tokens:
+                token = token.strip()
+                if not token:
+                    continue
+                
+                try:
+                    value = float(token)
+                    row.append(value)
+                except ValueError:
+                    try:
+                        value = float(token.replace('D', 'E').replace('d', 'e'))
+                        row.append(value)
+                    except ValueError:
+                        continue
+            
+            if row:
+                if expected_columns is None:
+                    expected_columns = len(row)
+                
+                if len(row) == expected_columns:
+                    data_rows.append(row)
+        
+        if not data_rows:
+            return np.array([])
+        
+        data_array = np.array(data_rows)
+        
+        finite_mask = np.all(np.isfinite(data_array), axis=1)
+        data_array = data_array[finite_mask]
+        
+        if data_array.size == 0:
+            raise ValueError("No valid finite data after filtering")
+        
+        return data_array
+    
+    def parse(self) -> Dict[str, np.ndarray]:
+        """Main parsing method"""
+        try:
+            lines = self.read_file()
+            headers, data_start = self.detect_headers_and_data_start(lines)
+            
+            numeric_data = self.parse_data_lines(lines, data_start)
+            
+            if numeric_data.size == 0:
+                raise ValueError("No numeric data found in file")
+            
+            data_arrays = {}
+            num_columns = numeric_data.shape[1]
+            
+            if headers and len(headers) <= num_columns:
+                for i, header in enumerate(headers):
+                    data_arrays[header] = numeric_data[:, i]
+                
+                for i in range(len(headers), num_columns):
+                    data_arrays[f'Variable_{i+1}'] = numeric_data[:, i]
+            else:
+                for i in range(num_columns):
+                    data_arrays[f'Variable_{i+1}'] = numeric_data[:, i]
+            
+            data_arrays = {k: v for k, v in data_arrays.items() if not np.all(np.isnan(v))}
+            
+            self.data_arrays = data_arrays
+            self.numeric_data = numeric_data
+            self.headers = list(data_arrays.keys())
+            
+            return data_arrays
+            
+        except Exception as e:
+            print(f"Error parsing file: {e}")
+            return {}
+
+class PlottingAnalyzer:
+    """
+    Intelligent plotting and analysis class
+    """
+    
+    def __init__(self, data_arrays: Dict[str, np.ndarray]):
+        self.data_arrays = data_arrays
+        self.plot_recommendations = {}
+        
+    def analyze_variable_characteristics(self, var_name: str) -> Dict:
+        """Analyze characteristics of a variable to determine best plotting approach"""
+        data = self.data_arrays[var_name]
+        
+        clean_data = data[~np.isnan(data)]
+        
+        if len(clean_data) == 0:
+            return {'log_scale': False, 'reason': 'No valid data'}
+        
+        characteristics = {
+            'min_val': np.min(clean_data),
+            'max_val': np.max(clean_data),
+            'range_ratio': np.max(clean_data) / np.min(clean_data) if np.min(clean_data) > 0 else 0,
+            'has_negatives': np.any(clean_data < 0),
+            'has_zeros': np.any(clean_data == 0),
+            'orders_of_magnitude': 0,
+            'log_scale': False,
+            'reason': ''
+        }
+        
+        if not characteristics['has_negatives'] and not characteristics['has_zeros']:
+            if characteristics['range_ratio'] > 100:
+                characteristics['log_scale'] = True
+                characteristics['orders_of_magnitude'] = np.log10(characteristics['range_ratio'])
+                characteristics['reason'] = f"Large range ({characteristics['orders_of_magnitude']:.1f} orders of magnitude)"
+        
+        return characteristics
+    
+    def determine_plot_scales(self, x_var: str, y_var: str) -> Tuple[str, str]:
+        """Determine the best scale for x and y axes"""
+        x_char = self.analyze_variable_characteristics(x_var)
+        y_char = self.analyze_variable_characteristics(y_var)
+        
+        x_scale = 'log' if x_char['log_scale'] else 'linear'
+        y_scale = 'log' if y_char['log_scale'] else 'linear'
+        
+        print(f"\nScale Analysis:")
+        print(f"X-axis ({x_var}): {x_scale} - {x_char['reason']}")
+        print(f"Y-axis ({y_var}): {y_scale} - {y_char['reason']}")
+        
+        return x_scale, y_scale
+    
+    def detect_oscillations(self, data: np.ndarray, sampling_rate: float = 1.0) -> Dict:
+        """Detect oscillations using multiple methods"""
+        clean_data = data[~np.isnan(data)]
+        
+        if len(clean_data) < 100:
+            return {'has_oscillation': False, 'frequency': 0, 'method': 'insufficient_data'}
+        
+        analysis_data = clean_data[-min(10000, len(clean_data)):]
+        
+        fft_result = self.fft_analysis(analysis_data, sampling_rate)
+        autocorr_result = self.autocorrelation_analysis(analysis_data, sampling_rate)
+        peak_result = self.peak_detection_analysis(analysis_data, sampling_rate)
+        
+        methods = [fft_result, autocorr_result, peak_result]
+        valid_methods = [m for m in methods if m['has_oscillation']]
+        
+        if not valid_methods:
+            return {'has_oscillation': False, 'frequency': 0, 'method': 'none_detected'}
+        
+        best_method = max(valid_methods, key=lambda x: x['confidence'])
+        
+        return best_method
+    
+    def fft_analysis(self, data: np.ndarray, sampling_rate: float) -> Dict:
+        """Analyze oscillations using FFT"""
+        try:
+            detrended = signal.detrend(data)
+            windowed = detrended * signal.windows.hann(len(detrended))
+            fft_vals = fft(windowed)
+            freqs = fftfreq(len(windowed), 1/sampling_rate)
+            pos_freqs = freqs[freqs > 0]
+            pos_fft = np.abs(fft_vals[freqs > 0])
+            
+            if len(pos_fft) > 0:
+                dominant_idx = np.argmax(pos_fft)
+                dominant_freq = pos_freqs[dominant_idx]
+                dominant_power = pos_fft[dominant_idx]
+                mean_power = np.mean(pos_fft)
+                confidence = min(dominant_power / mean_power / 10, 1.0)
+                
+                return {
+                    'has_oscillation': confidence > 0.3,
+                    'frequency': dominant_freq,
+                    'confidence': confidence,
+                    'method': 'FFT'
+                }
+        except Exception:
+            pass
+        
+        return {'has_oscillation': False, 'frequency': 0, 'confidence': 0, 'method': 'FFT_failed'}
+    
+    def autocorrelation_analysis(self, data: np.ndarray, sampling_rate: float) -> Dict:
+        """Analyze oscillations using autocorrelation"""
+        try:
+            detrended = signal.detrend(data)
+            autocorr = np.correlate(detrended, detrended, mode='full')
+            autocorr = autocorr[autocorr.size // 2:]
+            autocorr = autocorr / autocorr[0]
+            peaks, properties = signal.find_peaks(autocorr[1:], height=0.1, distance=10)
+            
+            if len(peaks) > 0:
+                period_samples = peaks[0] + 1
+                frequency = sampling_rate / period_samples
+                confidence = autocorr[peaks[0] + 1]
+                
+                return {
+                    'has_oscillation': confidence > 0.3,
+                    'frequency': frequency,
+                    'confidence': confidence,
+                    'method': 'Autocorrelation'
+                }
+        except Exception:
+            pass
+        
+        return {'has_oscillation': False, 'frequency': 0, 'confidence': 0, 'method': 'Autocorr_failed'}
+    
+    def peak_detection_analysis(self, data: np.ndarray, sampling_rate: float) -> Dict:
+        """Analyze oscillations using peak detection"""
+        try:
+            peaks, _ = signal.find_peaks(data, distance=len(data)//100)
+            troughs, _ = signal.find_peaks(-data, distance=len(data)//100)
+            
+            if len(peaks) > 2 and len(troughs) > 2:
+                peak_intervals = np.diff(peaks)
+                if len(peak_intervals) > 0:
+                    avg_period = np.mean(peak_intervals)
+                    frequency = sampling_rate / avg_period
+                    std_period = np.std(peak_intervals)
+                    confidence = max(0, 1 - std_period / avg_period)
+                    
+                    return {
+                        'has_oscillation': confidence > 0.3 and len(peaks) > 3,
+                        'frequency': frequency,
+                        'confidence': confidence,
+                        'method': 'Peak_detection'
+                    }
+        except Exception:
+            pass
+        
+        return {'has_oscillation': False, 'frequency': 0, 'confidence': 0, 'method': 'Peak_failed'}
+
+def get_user_input(data_arrays: Dict[str, np.ndarray]) -> Tuple[str, str]:
+    """Get user input for variables to plot"""
+    available_vars = list(data_arrays.keys())
+    
+    print(f"\nAvailable variables ({len(data_arrays)}):")
+    for i, var_name in enumerate(available_vars, 1):
+        data_info = f"({len(data_arrays[var_name])} points)"
+        print(f"{i}. {var_name} {data_info}")
+    
+    print(f"\nAvailable variables: {', '.join(available_vars)}")
+    
+    while True:
+        x_input = input(f"\nEnter X variable (name or number 1-{len(data_arrays)}): ").strip()
+        try:
+            x_idx = int(x_input) - 1
+            if 0 <= x_idx < len(available_vars):
+                x_var = available_vars[x_idx]
+                break
+            else:
+                print(f"Number must be between 1 and {len(available_vars)}")
+                continue
+        except ValueError:
+            if x_input in available_vars:
+                x_var = x_input
+                break
+            else:
+                print(f"Error: '{x_input}' not found in available variables")
+                continue
+    
+    while True:
+        y_input = input(f"Enter Y variable (name or number 1-{len(data_arrays)}): ").strip()
+        try:
+            y_idx = int(y_input) - 1
+            if 0 <= y_idx < len(available_vars):
+                y_var = available_vars[y_idx]
+                break
+            else:
+                print(f"Number must be between 1 and {len(available_vars)}")
+                continue
+        except ValueError:
+            if y_input in available_vars:
+                y_var = y_input
+                break
+            else:
+                print(f"Error: '{y_input}' not found in available variables")
+                continue
+    
+    return x_var, y_var
+
+def create_plots(data_arrays: Dict[str, np.ndarray], x_var: str, y_var: str, analyzer: PlottingAnalyzer):
+    """Create and save PNG plots with oscillation analysis"""
+    x_data = data_arrays[x_var]
+    y_data = data_arrays[y_var]
+    
+    valid_mask = np.isfinite(x_data) & np.isfinite(y_data)
+    x_clean = x_data[valid_mask]
+    y_clean = y_data[valid_mask]
+    
+    if len(x_clean) == 0:
+        print("No valid finite data points to plot!")
+        return
+    
+    sort_indices = np.argsort(x_clean)
+    x_sorted = x_clean[sort_indices]
+    y_sorted = y_clean[sort_indices]
+    
+    x_scale, y_scale = analyzer.determine_plot_scales(x_var, y_var)
+    
+    # Plot 1: Full data plot
+    plt.figure(figsize=(10, 6))
+    plt.plot(x_sorted, y_sorted, linewidth=0.8)
+    plt.xlabel(x_var)
+    plt.ylabel(y_var)
+    plt.title(f'{y_var} vs {x_var} - Full Data')
+    plt.grid(True, alpha=0.3)
+    if x_scale == 'log' and np.all(x_sorted > 0):
+        plt.xscale('log')
+    if y_scale == 'log' and np.all(y_sorted > 0):
+        plt.yscale('log')
+    plt.tight_layout()
+    full_plot_filename = f"plot_{x_var}_vs_{y_var}_full.png"
+    plt.savefig(full_plot_filename)
+    plt.close()
+    print(f"Saved full data plot as {full_plot_filename}")
+    
+    # Plot 2: Last 10000 points
+    if len(x_sorted) > 10000:
+        x_last = x_sorted[-10000:]
+        y_last = y_sorted[-10000:]
+    else:
+        x_last = x_sorted
+        y_last = y_sorted
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(x_last, y_last, linewidth=0.8)
+    plt.xlabel(x_var)
+    plt.ylabel(y_var)
+    plt.title(f'Last {len(y_last)} Points')
+    plt.grid(True, alpha=0.3)
+    if x_scale == 'log' and np.all(x_last > 0):
+        plt.xscale('log')
+    if y_scale == 'log' and np.all(y_last > 0):
+        plt.yscale('log')
+    plt.tight_layout()
+    last_plot_filename = f"plot_{x_var}_vs_{y_var}_last10000.png"
+    plt.savefig(last_plot_filename)
+    plt.close()
+    print(f"Saved last 10000 points plot as {last_plot_filename}")
+    
+    # Oscillation analysis
+    oscillation_result = analyzer.detect_oscillations(y_last)
+    print(f"\nOscillation Analysis Results:")
+    print(f"Method: {oscillation_result['method']}")
+    print(f"Has Oscillation: {oscillation_result['has_oscillation']}")
+    if oscillation_result['has_oscillation']:
+        print(f"Frequency: {oscillation_result['frequency']:.6f}")
+        print(f"Confidence: {oscillation_result.get('confidence', 0):.3f}")
+    
+    if oscillation_result['has_oscillation']:
+        if len(x_last) >= 2:
+            dx = np.mean(np.diff(x_last))
+            sampling_rate = 1.0 / dx if dx > 0 else 1.0
+        else:
+            sampling_rate = 1.0
+        
+        N = len(y_last)
+        yf = fft(y_last)
+        xf = fftfreq(N, 1/sampling_rate)
+        yf = np.abs(yf) / N
+        pos_mask = xf > 0
+        xf_pos = xf[pos_mask]
+        yf_pos = yf[pos_mask]
+        
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+        
+        ax1.plot(x_last, y_last, linewidth=0.8)
+        ax1.set_xlabel(x_var)
+        ax1.set_ylabel(y_var)
+        ax1.set_title(f'Last {len(y_last)} Points')
+        ax1.grid(True, alpha=0.3)
+        
+        ax2.plot(xf_pos, yf_pos, linewidth=0.8)
+        ax2.set_xlabel('Frequency')
+        ax2.set_ylabel('Amplitude')
+        ax2.set_title('Fourier Transform')
+        ax2.grid(True, alpha=0.3)
+        if 'frequency' in oscillation_result:
+            freq = oscillation_result['frequency']
+            ax2.axvline(x=freq, color='r', linestyle='--', label=f'Freq: {freq:.4f}')
+            ax2.legend()
+        
+        plt.tight_layout()
+        oscillation_filename = f"oscillation_analysis_{y_var}.png"
+        plt.savefig(oscillation_filename)
+        plt.close()
+        print(f"Saved oscillation analysis plot as {oscillation_filename}")
+
+def create_interactive_html(data_arrays: Dict[str, np.ndarray], filename: str = 'interactive_plot.html'):
+    """Generate an interactive HTML plot with dropdown variable selection"""
+    variable_names = list(data_arrays.keys())
+    
+    data_js = "var data = {\n"
+    for var_name, array in data_arrays.items():
+        array_list = [None if np.isnan(x) else float(x) for x in array]
+        data_js += f"    '{var_name}': {array_list},\n"
+    data_js += "};\n"
+    
+    options = "".join([f"<option value='{var}'>{var}</option>" for var in variable_names])
+    
+    html_content = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Interactive Data Plot</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }}
+        .container {{
+            max-width: 1000px;
+            margin: auto;
+        }}
+        .plot {{
+            width: 100%;
+            height: 600px;
+        }}
+        .controls {{
+            margin-bottom: 20px;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Interactive Data Plot</h1>
+        <div class="controls">
+            <label for="xSelect">X Variable:</label>
+            <select id="xSelect">{options}</select>
+            <label for="ySelect">Y Variable:</label>
+            <select id="ySelect">{options}</select>
+        </div>
+        <div id="plotDiv" class="plot"></div>
+    </div>
+    <script>
+        {data_js}
+        
+        var initialX = '{variable_names[0]}';
+        var initialY = '{variable_names[1] if len(variable_names) > 1 else variable_names[0]}';
+        
+        var trace = {{
+            x: data[initialX],
+            y: data[initialY],
+            mode: 'lines',
+            type: 'scatter'
+        }};
+        var layout = {{
+            title: 'Interactive Plot',
+            xaxis: {{title: initialX}},
+            yaxis: {{title: initialY}}
+        }};
+        Plotly.newPlot('plotDiv', [trace], layout);
+        
+        function updatePlot() {{
+            var xVar = document.getElementById('xSelect').value;
+            var yVar = document.getElementById('ySelect').value;
+            Plotly.restyle('plotDiv', {{x: [data[xVar]], y: [data[yVar]]}}, [0]);
+            Plotly.relayout('plotDiv', {{xaxis: {{title: xVar}}, yaxis: {{title: yVar}}}});
+        }}
+        
+        document.getElementById('xSelect').onchange = updatePlot;
+        document.getElementById('ySelect').onchange = updatePlot;
+    </script>
+</body>
+</html>
+"""
+    with open(filename, 'w') as f:
+        f.write(html_content)
+    print(f"Interactive HTML plot saved as {filename}")
+
+def main():
+    """Main function to run the DAT file analysis"""
+    filename = input("Enter the path to your .dat file: ").strip().strip('"\'')
+    
+    if not os.path.exists(filename):
+        print(f"File not found: {filename}")
+        return
+    
+    print(f"\nParsing file: {filename}")
+    
+    parser = DATFileParser(filename)
+    data_arrays = parser.parse()
+    
+    if not data_arrays:
+        print("Failed to parse any data from the file.")
+        return
+    
+    print(f"Successfully parsed {len(data_arrays)} variables")
+    
+    x_var, y_var = get_user_input(data_arrays)
+    print(f"\nSelected: X = {x_var}, Y = {y_var}")
+    
+    analyzer = PlottingAnalyzer(data_arrays)
+    create_plots(data_arrays, x_var, y_var, analyzer)
+    create_interactive_html(data_arrays)
+
+if __name__ == "__main__":
+    main()
